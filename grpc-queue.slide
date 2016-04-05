@@ -1,0 +1,201 @@
+gRPC Queue
+Queue framework for gRPC
+5 Apr 2016
+Tags: grcp queue
+
+Peter P. Gengler
+Sr. Software Engineer, JumpCloud
+https://github.com/ppg
+https://go-talks.appspot.com/github.com/ppg/grpc-queue/grpc-queue.slide
+
+
+* What are we trying to solve?
+
+- Trend towards microservices -> good for separation of concern, horizontal scaling, etc.
+- Large, distributed system can have (micro)services fail somewhat often.
+- Synchronous requests aren't durable; can do retries, but have limits.
+- Introduce durable queue, work off that queue.
+
+A solution?
+
+- Roll your own: define message formats, serialization, handlers, etc.
+
+
+* Queue Frameworks
+
+Similar to how you pick an http framework (http package, martini, negroni,
+etc.) to handle common functionality, you can pick from various queue
+frameworks:
+
+[[https://www.goworker.org/]]:
+
+- Made to operate with Resqueue (from the Ruby world).
+- Utilizes existing serialization/deserialization definitions.
+- Registers workers, but not type-safe.
+
+[[https://github.com/RichardKnop/machinery]]:
+
+- Arbitrary message format with serialization/deserialization provided.
+- Plugable backend brokers (redis, rabbitmq, etc.)
+- Registers workers, but not type-safe.
+
+And many more ...
+
+
+* Why Queue Framework?
+
+Take a step back and ask what we want:
+
+- Automatic Serialization/Deserialization of requests provided.
+- Ability to register handlers for requests; i.e. users.Insert, users.Delete, etc.
+- [bonus] Type safety to avoid casting and type checking.
+- [bonus] Abstraction of queue system -> brokers.
+
+Basically we'd like to write the unique code for a queue worker and not write
+any of the boilerplate code.
+
+This sounds like ...
+
+
+* gRPC!
+
+Looking back: [[https://go-talks.appspot.com/github.com/ppg/grpc-intro/grpc-intro.slide]]
+
+Per that talk, [[http://www.grpc.io/][gRPC]] is really about making type-safe,
+generated code around an IDL (protobuf) so that we implement only the
+functionality of the endpoints and none of the 'glue' code. Specifically:
+
+- IDL to define messages and RPCs (request/response).
+- Implementation of server (over HTTP/2) and ability to register RPCs.
+- Implementation of client (over HTTP/2) for type-safe RPCs.
+
+That's all our goals, but over HTTP/2 instead of a queue! (and without a response ... for now)
+
+Let's translate gRPC concepts into a queueing system.
+
+
+* IDL for queue messages
+
+.code grpcqueue/proto/queue_item.proto
+
+- Service/Method are routing information for messages; i.e. phonebook.Users and List/Insert/etc.
+- Payload is another (marshalled) protobuf message; arbitrary based on what services are registered.
+
+
+* IDL for testing
+
+.code proto/test.proto
+
+* Producing
+
+* Enqueue a message
+
+.code grpcqueue/producer.go /func Enqueue/,/^}/
+.caption _reference:_ [[https://github.com/grpc/grpc-go/blob/e3d8dfd9076c03272c6e3c7a0ac8671a0e0b374e/call.go#L103-L191][grpc-go/call.go]]
+
+* Enqueue a message - Explanation
+
+- Create a `QueueItem` message for the given service/method.
+- Marshal the `in` protobuf message into data (`[]byte`).
+- Assign to Payload.
+- Marshal `QueueItem` and enqueue.
+- TODO: protobuf supports an `Any` field type, probably can only serialize once.
+- _NOT_ type-safe, yet ...
+
+
+* Type-safe Producer
+
+.code proto/test.queue.pb.go /START PRODUCER OMIT/,/END PRODUCER OMIT/
+.caption  proto/test.queue.pb.go
+.caption _reference:_ [[https://github.com/ppg/grpc-queue/tree/proto/test.pb.go][grpc-queue/proto/test.pb.go]]
+
+* Type-safe Producer - Explanation
+
+- `Producer` interface like `Client` interface.
+- Utilizes `Enqueue` for `Enqueue<RPC>` with specific parameters based on type safety.
+- Manually wrote since short, but can/should make protoc generator.
+
+* Type-safe Producer - Usage
+
+  // Create a queue, producer, and enqueue a message
+  queue := make(chan []byte, 10)
+  producer := pb.NewTestQueueProducer(queue)
+  err := producer.EnqueueTestRPC(context.Background(), &pb.TestRPCRequest{Message: "Hello World"})
+  if err != nil {
+    log.Fatalf("Could not enqueue message: %s", err)
+  }
+
+- Like gRPC, once (auto-)generated type-safe producer coee, no other client code is necessary.
+- Could support different brokers.
+- Could support per enqueue options.
+- And more ...
+
+* Consuming
+
+* Consumer Definition
+.code grpcqueue/consumer.go /START CONSUMER DEFINITION OMIT/,/END CONSUMER DEFINITION OMIT/
+.caption _reference:_ [[https://github.com/grpc/grpc-go/blob/e3d8dfd9076c03272c6e3c7a0ac8671a0e0b374e/server.go#L78-L95][grpc-go/server.go]]
+
+* Register type-safe handlers
+
+.code grpcqueue/consumer.go /START REGISTER SERVICE OMIT/,/END REGISTER SERVICE OMIT/
+.caption _reference:_ [[https://github.com/grpc/grpc-go/blob/e3d8dfd9076c03272c6e3c7a0ac8671a0e0b374e/server.go#L186-L216][grpc-go/server.go]]
+
+* Register type-safe handlers - Explanation
+
+- Almost directly copied from referenced gRPC server.go code; store services in maps for lookup.
+- Manually wrote type-safe register (again) since short, but can/should make protoc generator:
+
+.code proto/test.queue.pb.go /START REGISTER OMIT/,/END REGISTER OMIT/
+.caption proto/test.queue.pb.go
+
+
+* Type-safe Consumer - Part1
+
+.code grpcqueue/consumer.go /START CONSUME PART1 OMIT/,/END CONSUME PART1 OMIT/
+
+* Type-safe Consumer - Part2
+
+.code grpcqueue/consumer.go /START CONSUME PART2 OMIT/,/END CONSUME PART2 OMIT/
+
+* Type-safe Consumer - Explanation
+
+Leverages [[https://github.com/grpc/grpc-go/blob/master/server.go][grpc-go/server.go]] concepts, but pulls from queue instead of TCP connection.
+
+Reverse of `Enqueue`:
+
+- Unmarshal `QueueItem`.
+- Unmarshal `Payload` (_NOT_ type-safe).
+- Call handler (type-safe via gRPC code).
+
+* Type-safe Consumer - Usage
+
+.code main.go /START TEST SERVER OMIT/,/END TEST SERVER OMIT/
+
+- Like gRPC requires you to implement the generated `<Service>Server` interface for actual functionality:
+
+  testService := &testServer{}
+  pb.RegisterTestQueueConsumer(consumer, testService)
+  if err := consumer.Consume(queue); err != nil {
+    log.Fatalf("consume failed: %s", err)
+  }
+  log.Fatal("consume stopped")
+
+- Like `grpc.Server` you can register multiple services on a queue based on how you want to organize services, queues, etc.
+
+
+* Putting it all together: code you write
+
+_NOTE:_ Only code in [[main.go][https://github.com/ppg/grpc-queue/blob/main.go]] is stuff a user writes.
+
+Consumer:
+.code main.go /START MAIN CONSUMER OMIT/,/END MAIN CONSUMER OMIT/
+
+* Putting it all together: code you write
+
+Producer:
+.code main.go /START MAIN PRODUCER OMIT/,/END MAIN PRODUCER OMIT/
+
+* Demo
+
+.play main.go /START MAIN WAIT OMIT/,/END MAIN WAIT OMIT/
