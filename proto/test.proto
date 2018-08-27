@@ -11,4 +11,5 @@ message TestRPCRequest {
 }
 
 message TestRPCResponse {
+  string message = 1;
 }
